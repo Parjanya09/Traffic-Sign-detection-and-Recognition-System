@@ -1,0 +1,15 @@
+{
+    "feature_extractor": "DINOv3",
+    "model": "dinov3_vits16",
+    "feature_dimension": 384,
+    "num_images": 13,
+    "num_classes": 6,
+    "classes": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5
+    ]
+}
