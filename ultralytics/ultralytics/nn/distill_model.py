@@ -528,7 +528,7 @@ class DistillationModel(nn.Module):
         loss_items["dis_loss"] = loss_distill.detach()
         loss_distill = loss_distill * batch["img"].shape[0]
         loss_dino = loss_dino * batch["img"].shape[0]
-        return torch.cat([regular_loss, loss_distill, loss_dino]), loss_items
+        return torch.cat([regular_loss, loss_dino]), loss_items # 
 
     def loss_sl2(
         self, student_feat: torch.Tensor, teacher_feat: torch.Tensor, feat_idx: int, teacher_scores: tuple
