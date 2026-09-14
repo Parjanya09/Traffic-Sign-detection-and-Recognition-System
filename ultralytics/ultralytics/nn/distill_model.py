@@ -380,7 +380,10 @@ class DistillationModel(nn.Module):
         loss_dino = self._compute_dino_loss(images) * self.dino_weight
 
         batch_size = images.shape[0]
-        total_loss = torch.cat([regular_loss]) + (loss_distill + loss_dino) * batch_size
+        if regular_loss.ndim == 0:
+            total_loss = regular_loss + (loss_distill + loss_dino) * batch_size
+        else:
+            total_loss = regular_loss.sum() + (loss_distill + loss_dino) * batch_size
 
         loss_items["dino_loss"] = loss_dino.detach()
         loss_items["dis_loss"] = loss_distill.detach()
