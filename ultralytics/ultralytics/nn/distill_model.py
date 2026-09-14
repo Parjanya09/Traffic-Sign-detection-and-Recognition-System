@@ -93,7 +93,7 @@ class DistillationModel(nn.Module):
         dummy_size = min(int(imgsz), 320)
 
         student_model.eval()
-        with torch.inference_mode():
+        with torch.no_grad():
             dummy = torch.zeros(1, ch, dummy_size, dummy_size, device=device)
             self.teacher_model(dummy)
             student_model(dummy)
@@ -322,7 +322,7 @@ class DistillationModel(nn.Module):
     def _compute_rtdetr_feature_loss(self, teacher_feats, student_feats):
         total = next(iter(teacher_feats.values())).new_zeros(())
         for i, idx in enumerate(self.feats_idx):
-            tf = self._as_feature_tensor(teacher_feats[idx]).detach()
+            tf = self._as_feature_tensor(teacher_feats[idx]).detach().clone()
             sf = self.projector[i](self._as_feature_tensor(student_feats[idx]))
             if sf.shape[-2:] != tf.shape[-2:]:
                 sf = F.interpolate(sf, size=tf.shape[-2:], mode="bilinear", align_corners=False)
@@ -341,7 +341,7 @@ class DistillationModel(nn.Module):
 
         total = head.new_zeros(())
         for i, idx in enumerate(self.feats_idx[:-1]):
-            tf = self.decouple_outputs(teacher_feats[idx]).detach()
+            tf = self.decouple_outputs(teacher_feats[idx]).detach().clone()
             sf = self.projector[i](self.decouple_outputs(student_feats[idx]))
             total = total + self.loss_sl2(sf, tf, i, scores)
         return total * self.dis
