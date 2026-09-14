@@ -347,6 +347,8 @@ class DistillationModel(nn.Module):
         return total * self.dis
 
     def loss(self, batch, preds=None):
+        # NOTE: teacher forward uses torch.no_grad(), NOT torch.inference_mode().
+        # Its outputs are used as targets by autograd-tracked KD losses.
         images = batch["img"]
         zero = images.new_zeros(())
 
@@ -361,7 +363,7 @@ class DistillationModel(nn.Module):
         self._teacher_feats.clear()
         self._student_feats.clear()
 
-        with torch.inference_mode():
+        with torch.no_grad():
             self.teacher_model(images)
 
         preds = self.student_model(images)
