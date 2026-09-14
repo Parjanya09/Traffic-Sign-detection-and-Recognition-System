@@ -180,19 +180,14 @@ class DistillationModel(nn.Module):
 
         # ------------------------------------------------------------
         # Feature projectors.
-        # For every selected feature except the final DINO feature, align
-        # student channels to teacher channels.
+        # Every selected layer is a real [B,C,H,W] feature map.
         # ------------------------------------------------------------
         projectors = []
 
-        # For YOLO the final Detect feature is handled separately for
-        # score-weighted distillation. RT-DETR has only multiscale feature
-        # inputs, so all selected RT-DETR features receive a projector.
-        projector_pairs = (
-            zip(student_output[:-1], teacher_output[:-1])
-            if self.model_type == "yolo"
-            else zip(student_output, teacher_output)
-        )
+        # Both YOLO and RT-DETR use all selected feature maps for feature KD.
+        # The detection head/decoder itself is deliberately excluded from
+        # self.feats_idx, so there is no need for a special final-layer case.
+        projector_pairs = zip(student_output, teacher_output)
 
         for student_out, teacher_out in projector_pairs:
             student_dim = student_out.shape[1]
@@ -223,10 +218,19 @@ class DistillationModel(nn.Module):
 
         self.projector = nn.ModuleList(projectors).to(device)
 
-        # DINO operates on the deepest convenient feature map.
-        # For YOLO26 [16,19,22,23] -> layer 22.
-        # For RT-DETR [21,24,27] -> layer 24.
-        dino_index = max(0, len(student_output) - 2)
+        # ------------------------------------------------------------
+        # DINO feature selection.
+        # YOLO26:  [16, 19, 22] -> layer 22 (deepest Detect input)
+        # RT-DETR: [21, 24, 27] -> layer 24 (middle multiscale feature)
+        # ------------------------------------------------------------
+        if self.model_type == "yolo":
+            dino_index = len(student_output) - 1
+        elif self.model_type == "rtdetr":
+            dino_index = len(student_output) // 2
+        else:
+            raise ValueError(
+                f"Unsupported model type for DINO: {self.model_type}"
+            )
 
         dino_student_feat = student_output[dino_index]
         dino_teacher_feat = teacher_output[dino_index]
@@ -290,7 +294,9 @@ class DistillationModel(nn.Module):
         Find feature layers used for distillation.
 
         YOLO:
-            Uses Detect.f plus the Detect head itself.
+            Uses the feature maps feeding Detect. The Detect head itself is
+            deliberately excluded because its training output is a tuple,
+            not a [B,C,H,W] feature tensor.
 
         RT-DETR:
             Uses the multiscale feature maps feeding RTDETRDecoder.
@@ -300,7 +306,10 @@ class DistillationModel(nn.Module):
 
         for m in model.model:
             if isinstance(m, Detect):
-                return [*list(m.f), m.i]
+                # m.f are the multiscale feature maps consumed by Detect.
+                # Do NOT append m.i: the Detect head output is not a plain
+                # [B,C,H,W] feature map during training.
+                return list(m.f)
 
             if isinstance(m, RTDETRDecoder):
                 # RT-DETR decoder receives multiscale feature maps through f.
@@ -878,7 +887,7 @@ class DistillationModel(nn.Module):
                 + dino_weight * L_DINO
 
         YOLO:
-            L_feature is score-weighted.
+            L_feature is multiscale feature MSE on Detect input features.
 
         RT-DETR:
             L_feature is architecture-agnostic multiscale feature MSE.
@@ -1024,54 +1033,14 @@ class DistillationModel(nn.Module):
 
         if self.model_type == "yolo":
             # --------------------------------------------------------
-            # Preserve the original YOLO26/YOLO Detect-family
-            # score-weighted distillation.
+            # YOLO feature distillation.
             # --------------------------------------------------------
-            teacher_head_feat = original_teacher_feats[
-                self.feats_idx[-1]
-            ]
-
-            teacher_one2many = self.decouple_outputs(
-                teacher_head_feat,
-                branch="one2many",
-            )
-
-            teacher_one2one = self.decouple_outputs(
-                teacher_head_feat,
-                branch="one2one",
-            )
-
-            teacher_scores = (
-                teacher_one2many["scores"]
-                + teacher_one2one["scores"]
-            ) / 2
-
-            neck_feats = [
-                original_teacher_feats[idx]
-                for idx in self.feats_idx[:-1]
-            ]
-
-            # The YOLO head scores are flattened over all feature levels.
-            parts = torch.split(
-                teacher_scores,
-                [
-                    f.shape[-2] * f.shape[-1]
-                    for f in neck_feats
-                ],
-                dim=-1,
-            )
-
-            teacher_scores = tuple(
-                p.sigmoid().max(
-                    dim=1,
-                    keepdim=True,
-                ).values
-                for p in parts
-            )
-
-            for i, feat_idx in enumerate(
-                self.feats_idx[:-1]
-            ):
+            # Only the feature maps feeding Detect are distilled. The Detect
+            # head output is intentionally excluded from self.feats_idx.
+            # Use the same normalized feature MSE as RT-DETR here so the
+            # distillation target is a genuine [B,C,H,W] representation.
+            # --------------------------------------------------------
+            for i, feat_idx in enumerate(self.feats_idx):
                 teacher_feat = self._as_feature(
                     original_teacher_feats[feat_idx]
                 )
@@ -1087,7 +1056,7 @@ class DistillationModel(nn.Module):
                         student_feat,
                         teacher_feat,
                         feat_idx=i,
-                        teacher_scores=teacher_scores,
+                        teacher_scores=None,
                     )
                     * self.dis
                 )
@@ -1147,8 +1116,8 @@ class DistillationModel(nn.Module):
 
         return total_loss, loss_items
 
-    @staticmethod
     def _combine_detection_and_distill_loss(
+        self,
         regular_loss,
         loss_distill,
         loss_dino,
@@ -1183,7 +1152,7 @@ class DistillationModel(nn.Module):
         )
 
         dino_term = (
-            loss_dino * batch_size
+            loss_dino * self.dino_weight * batch_size
         )
 
         return (
