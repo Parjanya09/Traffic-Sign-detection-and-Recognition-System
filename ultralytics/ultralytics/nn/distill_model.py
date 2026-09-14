@@ -1,37 +1,26 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-
 from __future__ import annotations
-
 from pathlib import Path
+from copy import deepcopy
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from ultralytics.nn.modules.head import Detect
+from ultralytics.nn.modules.head import Detect, RTDETRDecoder
 from ultralytics.utils.torch_utils import copy_attr
-from copy import deepcopy
-
 from .tasks import load_checkpoint
 
-class DINOHead(nn.Module):
-    """Prototype head for DINO-style self-distillation."""
 
+class DINOHead(nn.Module):
     def __init__(self, in_dim, hidden_dim=512, bottleneck_dim=256, out_dim=1024):
         super().__init__()
-
         self.mlp = nn.Sequential(
-            nn.Conv2d(in_dim, hidden_dim, kernel_size=1),
+            nn.Conv2d(in_dim, hidden_dim, 1),
             nn.GELU(),
-            nn.Conv2d(hidden_dim, bottleneck_dim, kernel_size=1),
+            nn.Conv2d(hidden_dim, bottleneck_dim, 1),
         )
-
-        self.last_layer = nn.Conv2d(
-            bottleneck_dim,
-            out_dim,
-            kernel_size=1,
-            bias=False,
-        )
+        self.last_layer = nn.Conv2d(bottleneck_dim, out_dim, 1, bias=False)
 
     def forward(self, x):
         x = self.mlp(x)
@@ -39,59 +28,29 @@ class DINOHead(nn.Module):
         x = F.normalize(x, dim=1)
         return self.last_layer(x).flatten(1)
 
+
 class FeatureHook:
-    """Picklable forward hook that stores layer output into a shared dict."""
+    def __init__(self, feat_dict: dict, idx: int):
+        self.feat_dict, self.idx = feat_dict, idx
 
-    def __init__(self, feat_dict: dict, idx: int) -> None:
-        """Initialize the hook with the shared feature dict and the layer index to store outputs under."""
-        self.feat_dict = feat_dict
-        self.idx = idx
-
-    def __call__(self, module: nn.Module, inputs: tuple, output) -> None:
-        """Store the layer's forward output into the shared feature dict under its index.
-
-        The output is a tensor for neck layers but a tuple/dict for the Detect head, so it is left untyped.
-        """
+    def __call__(self, module, inputs, output):
         self.feat_dict[self.idx] = output
 
 
 class DistillationModel(nn.Module):
-    """YOLO knowledge distillation model.
+    """Memory-safe YOLO/RT-DETR teacher-student KD with optional DINO.
 
-    This class wraps a teacher-student pair for knowledge distillation training. Features are extracted from both models
-    via forward hooks for distillation.
+    Recommended first run:
+        dino_distill=True
+        dino_global_views=1
+        dino_local_views=0
 
-    Attributes:
-        teacher_model (nn.Module): Frozen teacher model providing features.
-        student_model (nn.Module): Trainable student model being distilled.
-        feats_idx (list): Layer indices for feature extraction.
-        projector (nn.ModuleList): MLP projector aligning student features to teacher dimensions.
-        dis (float): Distillation loss weight factor.
-
-    Methods:
-        get_distill_layers: Auto-detect distillation feature layers from the Detect head.
-        forward: Run the student model, or compute the combined loss when given a training batch.
-        loss: Compute combined detection and distillation loss.
-        loss_sl2: Compute score-weighted L2 distillation loss for a feature pair.
-        decouple_outputs: Normalize teacher/student head outputs across train/val formats.
-        fuse: Fuse and return the student model for inference and export.
-        train: Set training mode while keeping teacher frozen.
-
-    Examples:
-        Train a student model with knowledge distillation from a larger teacher (the trainer builds the
-        DistillationModel internally when the ``distill_model`` argument is set)
-        >>> from ultralytics import YOLO
-        >>> model = YOLO("yolo26n.pt")
-        >>> model.train(data="coco8.yaml", distill_model="yolo26s.pt")
+    Later, after memory is verified:
+        dino_global_views=2
+        dino_local_views=2 or 4
     """
-    #modified __init__ 08-09-2026
-    def __init__(self, teacher_model: str | Path | nn.Module | None, student_model: nn.Module):
-        """Initialize the distillation model with teacher, student, and feature extraction hooks.
 
-        Args:
-            teacher_model (str | Path | nn.Module): Teacher model checkpoint path or module.
-            student_model (nn.Module): Student model module to be trained.
-        """
+    def __init__(self, teacher_model: str | Path | nn.Module | None, student_model: nn.Module):
         super().__init__()
         ch = student_model.yaml.get("channels", 3)
         device = next(student_model.parameters()).device
@@ -99,7 +58,13 @@ class DistillationModel(nn.Module):
         self.student_model = student_model
         self.student_model.train()
         self.student_model.requires_grad_(True)
+
         self.self_distill = bool(student_model.args.get("dino_distill", False))
+        self.dino_enabled = self.self_distill
+        self.dino_global_views = max(0, int(student_model.args.get("dino_global_views", 1)))
+        self.dino_local_views = max(0, int(student_model.args.get("dino_local_views", 0)))
+        self.dino_weight = float(student_model.args.get("dino_weight", 1.0))
+        self.dis = float(student_model.args.get("dis", 6.0))
 
         if self.self_distill:
             self.teacher_model = deepcopy(student_model).to(device)
@@ -109,127 +74,140 @@ class DistillationModel(nn.Module):
                 if teacher_model.yaml.get("channels", 3) != ch:
                     weights = teacher_model
                     teacher_model = type(weights)(
-                    weights.yaml.copy(),
-                    ch=ch,
-                    nc=weights.yaml["nc"],
-                    verbose=False,
+                        weights.yaml.copy(), ch=ch, nc=weights.yaml["nc"], verbose=False
                     )
                     teacher_model.load(weights)
             self.teacher_model = teacher_model.to(device)
 
-        self._freeze_teacher() # modified this student model and teacher model section from device ..
+        self._freeze_teacher()
+        self.is_rtdetr = any(isinstance(m, RTDETRDecoder) for m in student_model.model)
         self.feats_idx = self.get_distill_layers(student_model)
 
-        # Hook-based feature capture: identical for teacher and student
-        self._teacher_feats: dict[int, torch.Tensor] = {}
-        self._student_feats: dict[int, torch.Tensor] = {}
-        self._teacher_hooks: list = []
-        self._student_hooks: list = []
+        self._teacher_feats, self._student_feats = {}, {}
+        self._teacher_hooks, self._student_hooks = [], []
         self._register_feature_hooks()
 
-        # Get feature dimensions via dummy forward pass (hooks capture outputs)
-        imgsz = student_model.args.get("imgsz")
+        imgsz = student_model.args.get("imgsz", 640)
+        if isinstance(imgsz, (list, tuple)):
+            imgsz = imgsz[0]
+        dummy_size = min(int(imgsz), 320)
+
         student_model.eval()
-        with torch.no_grad():
-            im = torch.zeros(2, ch, imgsz, imgsz, device=device)
-            self.teacher_model(im)
-            student_model(im)
+        with torch.inference_mode():
+            dummy = torch.zeros(1, ch, dummy_size, dummy_size, device=device)
+            self.teacher_model(dummy)
+            student_model(dummy)
         student_model.train()
-        teacher_output = [self._teacher_feats[idx] for idx in self.feats_idx]
-        student_output = [self._student_feats[idx] for idx in self.feats_idx]
+
+        teacher_outs = [self._as_feature_tensor(self._teacher_feats[i]) for i in self.feats_idx]
+        student_outs = [self._as_feature_tensor(self._student_feats[i]) for i in self.feats_idx]
 
         copy_attr(self, student_model)
-        self.dis = self.student_model.args.get("dis", 6.0)
-        projectors = []
-        for student_out, teacher_out in zip(student_output[:-1], teacher_output[:-1]):
-            student_dim = self.decouple_outputs(student_out).shape[1]
-            teacher_dim = self.decouple_outputs(teacher_out).shape[1]
-            projectors.append(
-                nn.Sequential(
-                    nn.Conv2d(student_dim, teacher_dim, kernel_size=1, stride=1, padding=0),
+
+        self.projector = nn.ModuleList()
+        for sf, tf in zip(student_outs, teacher_outs):
+            if sf.shape[1] == tf.shape[1]:
+                self.projector.append(nn.Identity())
+            else:
+                self.projector.append(nn.Sequential(
+                    nn.Conv2d(sf.shape[1], tf.shape[1], 1),
                     nn.ReLU(inplace=True),
-                    nn.Conv2d(teacher_dim, teacher_dim, kernel_size=1, stride=1, padding=0),
-                )
-            )
-        self.projector = nn.ModuleList(projectors).to(device)
-        dino_student_feat = self.decouple_outputs(student_output[-2])
-        dino_teacher_feat = self.decouple_outputs(teacher_output[-2])
-        self.dino_student_projector = DINOHead(
-            dino_student_feat.shape[1],
-            hidden_dim=512,
-            bottleneck_dim=256,
-            out_dim=1024,
-        ).to(device)
-        self.dino_teacher_projector = DINOHead(
-            dino_teacher_feat.shape[1],
-            hidden_dim=512,
-            bottleneck_dim=256,
-            out_dim=1024,
-        ).to(device)
-        self.dino_teacher_projector.load_state_dict(
-            self.dino_student_projector.state_dict()
-        )
-        for param in self.dino_teacher_projector.parameters():
-            param.requires_grad = False
-        self.register_buffer("dino_center",torch.zeros(1, 1024, device=device),)
+                    nn.Conv2d(tf.shape[1], tf.shape[1], 1),
+                ))
+
+        dino_sf = student_outs[-1]
+        dino_tf = teacher_outs[-1]
+        self.dino_student_projector = DINOHead(dino_sf.shape[1]).to(device)
+        self.dino_teacher_projector = DINOHead(dino_tf.shape[1]).to(device)
+        self.dino_teacher_projector.load_state_dict(self.dino_student_projector.state_dict())
+        self.dino_teacher_projector.requires_grad_(False)
+        self.dino_teacher_projector.eval()
+
+        self.register_buffer("dino_center", torch.zeros(1, 1024, device=device))
         self.dino_center_momentum = 0.9
 
-    # added update_tecaher funtion 08-09-2026
+        self._teacher_feats.clear()
+        self._student_feats.clear()
+
+    @staticmethod
+    def _as_feature_tensor(x):
+        if torch.is_tensor(x):
+            return x
+        if isinstance(x, (list, tuple)):
+            for v in reversed(x):
+                if torch.is_tensor(v):
+                    return v
+        if isinstance(x, dict):
+            for k in ("features", "feat", "output"):
+                if k in x and torch.is_tensor(x[k]):
+                    return x[k]
+            for v in reversed(list(x.values())):
+                if torch.is_tensor(v):
+                    return v
+        raise TypeError(f"Expected feature tensor, got {type(x)}")
+
+    @staticmethod
+    def get_distill_layers(model):
+        for m in model.model:
+            if isinstance(m, Detect):
+                return [*list(m.f), m.i]
+            if isinstance(m, RTDETRDecoder):
+                return list(m.f)
+        raise ValueError("No Detect or RTDETRDecoder head found in model")
+
+    def _freeze_teacher(self):
+        if self.teacher_model is None:
+            return
+        self.teacher_model.eval()
+        self.teacher_model.requires_grad_(False)
+        if hasattr(self, "dino_teacher_projector"):
+            self.dino_teacher_projector.eval()
+            self.dino_teacher_projector.requires_grad_(False)
+
+    def train(self, mode=True):
+        super().train(mode)
+        self._freeze_teacher()
+        return self
+
     @torch.no_grad()
     def update_teacher(self):
-        """Update DINO teacher using EMA of student."""
         if not self.self_distill or self.teacher_model is None:
             return
-
-        momentum = self.student_model.args.get("distill_momentum", 0.996)
-        for teacher_param, student_param in zip(self.teacher_model.parameters(), self.student_model.parameters(),):
-            teacher_param.mul_(momentum).add_(student_param,alpha=1.0 - momentum,)
-
-        for teacher_buffer, student_buffer in zip(self.teacher_model.buffers(),self.student_model.buffers(),):
-            teacher_buffer.copy_(student_buffer)
-        for teacher_param, student_param in zip(self.dino_teacher_projector.parameters(),self.dino_student_projector.parameters(),):
-            teacher_param.mul_(momentum).add_(student_param,alpha=1.0 - momentum,)
+        momentum = float(self.student_model.args.get("distill_momentum", 0.996))
+        for tp, sp in zip(self.teacher_model.parameters(), self.student_model.parameters()):
+            tp.mul_(momentum).add_(sp, alpha=1.0 - momentum)
+        for tb, sb in zip(self.teacher_model.buffers(), self.student_model.buffers()):
+            tb.copy_(sb)
+        for tp, sp in zip(self.dino_teacher_projector.parameters(), self.dino_student_projector.parameters()):
+            tp.mul_(momentum).add_(sp, alpha=1.0 - momentum)
 
     def __getstate__(self):
-        """Return a copy of state for pickling without captured features or hook handles.
-
-        Clears the feature dicts in place (rather than replacing the attributes) because the registered
-        FeatureHooks share these exact dict objects; otherwise a deepcopy/pickle of a mid-training model would
-        still reach the hook-held tensors (which carry grad_fn and cannot be deep-copied).
-        """
         self._teacher_feats.clear()
         self._student_feats.clear()
         state = self.__dict__.copy()
-        state["_teacher_hooks"] = []
-        state["_student_hooks"] = []
+        state["_teacher_hooks"], state["_student_hooks"] = [], []
         return state
 
     def __setstate__(self, state):
-        """Clear stale features and hooks, and re-register forward hooks after unpickling."""
         self.__dict__.update(state)
-        self._teacher_feats = {}
-        self._student_feats = {}
+        self._teacher_feats, self._student_feats = {}, {}
         self._register_feature_hooks()
 
-    def _remove_feature_hooks(self) -> None:
-        """Remove any previously registered feature-capture hooks."""
-        for handle in self._student_hooks:
-            handle.remove()
+    def _remove_feature_hooks(self):
+        for h in self._student_hooks:
+            h.remove()
         self._student_hooks.clear()
-        if self.teacher_model is not None:
-            for handle in self._teacher_hooks:
-                handle.remove()
-            self._teacher_hooks.clear()
+        for h in self._teacher_hooks:
+            h.remove()
+        self._teacher_hooks.clear()
 
     @staticmethod
-    def _clear_feature_hooks(module: nn.Module) -> None:
-        """Remove any FeatureHook instances from a module's forward hooks."""
-        for handle_id, hook in list(module._forward_hooks.items()):
+    def _clear_feature_hooks(module):
+        for hid, hook in list(module._forward_hooks.items()):
             if isinstance(hook, FeatureHook):
-                del module._forward_hooks[handle_id]
+                del module._forward_hooks[hid]
 
-    def _register_feature_hooks(self) -> None:
-        """Register feature-capture hooks, removing stale FeatureHook instances first."""
+    def _register_feature_hooks(self):
         self._remove_feature_hooks()
         for idx in self.feats_idx:
             self._clear_feature_hooks(self.student_model.model[idx])
@@ -242,359 +220,206 @@ class DistillationModel(nn.Module):
                     self.teacher_model.model[idx].register_forward_hook(FeatureHook(self._teacher_feats, idx))
                 )
 
-    @staticmethod
-    def get_distill_layers(model: nn.Module) -> list[int]:
-        """Auto-detect distillation feature layers from the model's Detect head.
-
-        Returns the Detect head's input layer indices plus the head layer index itself.
-        E.g. YOLO26 -> [16, 19, 22, 23], YOLOv8 -> [15, 18, 21, 22].
-        """
-        for m in model.model:
-            if isinstance(m, Detect):
-                return [*list(m.f), m.i]
-        raise ValueError("No Detect head found in model")
-
-    def _freeze_teacher(self):
-        """Keep teacher fixed for distillation."""
-        if self.teacher_model is None:
-            return
-        self.teacher_model.eval()
-        for v in self.teacher_model.parameters():
-            if v.requires_grad:
-                v.requires_grad = False
-
-    def train(self, mode: bool = True):
-        """Set model train mode while keeping teacher frozen in eval mode."""
-        super().train(mode)
-        self._freeze_teacher()
-        return self
-
     def forward(self, x, *args, **kwargs):
-        """Forward pass through the student model."""
-        if isinstance(x, dict):  # for cases of training and validating while training.
+        if isinstance(x, dict):
             return self.loss(x, *args, **kwargs)
         return self.student_model.predict(x, *args, **kwargs)
 
-    def fuse(self, verbose: bool = True, imgsz: int | list[int, int] = 640):
-        """Fuse and return the student model, dropping the training-only distillation wrapper."""
+    def fuse(self, verbose=True, imgsz=640):
         self._remove_feature_hooks()
         return self.student_model.fuse(verbose=verbose, imgsz=imgsz)
 
     def dino_augment(self, crop):
-        """Apply DINO-style augmentations to a crop."""
-    # Color jitter
-        if torch.rand(1, device=crop.device).item() < 0.8:
-            brightness = torch.empty(1, device=crop.device).uniform_(0.6, 1.4).item()
-            contrast = torch.empty(1, device=crop.device).uniform_(0.6, 1.4).item()
-            saturation = torch.empty(1, device=crop.device).uniform_(0.6, 1.4).item()
-
-        # Brightness
-            crop = crop * brightness
-
-        # Contrast around per-image mean
+        if torch.rand((), device=crop.device) < 0.8:
+            b = torch.empty((), device=crop.device).uniform_(0.6, 1.4)
+            c = torch.empty((), device=crop.device).uniform_(0.6, 1.4)
+            s = torch.empty((), device=crop.device).uniform_(0.6, 1.4)
+            crop = crop * b
             mean = crop.mean(dim=(2, 3), keepdim=True)
-            crop = (crop - mean) * contrast + mean
-
-        # Approximate saturation adjustment
+            crop = (crop - mean) * c + mean
             gray = crop.mean(dim=1, keepdim=True)
-            crop = gray + (crop - gray) * saturation
-
-            crop = crop.clamp(0, 1)
-
-    # Random grayscale
-        if torch.rand(1, device=crop.device).item() < 0.2:
+            crop = gray + (crop - gray) * s
+        if torch.rand((), device=crop.device) < 0.2:
             gray = crop.mean(dim=1, keepdim=True)
             crop = gray.repeat(1, 3, 1, 1)
-
-    # Gaussian blur
-        if torch.rand(1, device=crop.device).item() < 0.5:
-            crop = F.avg_pool2d(
-            crop,
-            kernel_size=5,
-            stride=1,
-            padding=2,
-        )
-
-    # Solarization
-        if torch.rand(1, device=crop.device).item() < 0.2:
+        if torch.rand((), device=crop.device) < 0.5:
+            crop = F.avg_pool2d(crop, 5, 1, 2)
+        if torch.rand((), device=crop.device) < 0.2:
             crop = torch.where(crop > 0.5, 1.0 - crop, crop)
         return crop.clamp(0, 1)
 
-    def create_dino_views(self, images):
-        """Create DINO-style global and local crops independently per image."""
-        batch_size, _, h, w = images.shape
+    def _make_one_view(self, images, local=False):
+        bsz, _, h, w = images.shape
+        crops = []
+        low, high = (0.05, 0.32) if local else (0.32, 1.0)
+        out_size = max(32, min(h, w) // 2) if local else (h, w)
 
-        global_views = []
-        local_views = []
+        for b in range(bsz):
+            scale = torch.empty((), device=images.device).uniform_(low, high).item()
+            ch, cw = max(32, int(h * scale)), max(32, int(w * scale))
+            top = torch.randint(0, max(1, h - ch + 1), (), device=images.device).item()
+            left = torch.randint(0, max(1, w - cw + 1), (), device=images.device).item()
+            crop = images[b:b+1, :, top:top+ch, left:left+cw]
+            crop = F.interpolate(crop, size=out_size, mode="bilinear", align_corners=False)
+            if torch.rand((), device=images.device) < 0.5:
+                crop = crop.flip(-1)
+            crops.append(self.dino_augment(crop))
+        return torch.cat(crops, dim=0)
 
-        # Two global crops
-        for _ in range(2):
-            crops = []
+    @torch.no_grad()
+    def _teacher_dino_output(self, view):
+        self._teacher_feats.clear()
+        self.teacher_model(view)
+        feat = self._as_feature_tensor(self._teacher_feats[self.feats_idx[-1]])
+        return self.dino_teacher_projector(feat)
 
-            for b in range(batch_size):
-                scale = torch.empty(1, device=images.device).uniform_(0.32, 1.0).item()
+    def _student_dino_output(self, view):
+        self._student_feats.clear()
+        self.student_model(view)
+        feat = self._as_feature_tensor(self._student_feats[self.feats_idx[-1]])
+        return self.dino_student_projector(feat)
 
-                crop_h = max(32, int(h * scale))
-                crop_w = max(32, int(w * scale))
-
-                top = torch.randint(
-                0,
-                max(1, h - crop_h + 1),
-                (1,),
-                device=images.device,
-            ).item()
-
-                left = torch.randint(
-                0,
-                max(1, w - crop_w + 1),
-                (1,),
-                device=images.device,
-            ).item()
-
-                crop = images[
-                b:b + 1,
-                :,
-                top:top + crop_h,
-                left:left + crop_w,
-            ]
-
-                crop = F.interpolate(
-                crop,
-                size=(h, w),
-                mode="bilinear",
-                align_corners=False,
-            )
-
-                if torch.rand(1, device=images.device).item() < 0.5:
-                    crop = crop.flip(-1)
-                crop = self.dino_augment(crop)
-                crops.append(crop)
-
-            global_views.append(torch.cat(crops, dim=0))
-
-    # Eight local crops
-        local_size = max(32, min(h, w) // 2)
-
-        for _ in range(8):
-            crops = []
-
-            for b in range(batch_size):
-                scale = torch.empty(1, device=images.device).uniform_(0.05, 0.32).item()
-
-                crop_h = max(32, int(h * scale))
-                crop_w = max(32, int(w * scale))
-
-                top = torch.randint(
-                0,
-                max(1, h - crop_h + 1),
-                (1,),
-                device=images.device,
-            ).item()
-
-                left = torch.randint(
-                0,
-                max(1, w - crop_w + 1),
-                (1,),
-                device=images.device,
-            ).item()
-
-                crop = images[
-                b:b + 1,
-                :,
-                top:top + crop_h,
-                left:left + crop_w,
-            ]
-
-                crop = F.interpolate(
-                crop,
-                size=(local_size, local_size),
-                mode="bilinear",
-                align_corners=False,
-            )
-
-                if torch.rand(1, device=images.device).item() < 0.5:
-                    crop = crop.flip(-1)
-
-                crops.append(crop)
-
-            local_views.append(torch.cat(crops, dim=0))
-
-        return global_views, local_views
-        
-    def dino_loss(self,student_output: torch.Tensor,teacher_output: torch.Tensor,student_temp: float = 0.1,teacher_temp: float = 0.04,) -> torch.Tensor:
-        """Compute DINO cross-entropy with teacher centering."""
-        student_output = student_output / student_temp
-        student_log_probs = F.log_softmax(student_output, dim=1)
-
+    def dino_loss(self, student_output, teacher_output, student_temp=0.1, teacher_temp=0.04):
+        student_log_probs = F.log_softmax(student_output / student_temp, dim=1)
         with torch.no_grad():
-            batch_center = teacher_output.mean(dim=0, keepdim=True)
+            center = teacher_output.mean(dim=0, keepdim=True)
             self.dino_center.mul_(self.dino_center_momentum).add_(
-                batch_center,
-                alpha=1.0 - self.dino_center_momentum,
+                center, alpha=1.0 - self.dino_center_momentum
             )
+            teacher_probs = F.softmax(
+                (teacher_output - self.dino_center) / teacher_temp, dim=1
+            )
+        return -(teacher_probs * student_log_probs).sum(dim=1).mean()
 
-            teacher_output = teacher_output - self.dino_center
-            teacher_output = teacher_output / teacher_temp
-            teacher_probs = F.softmax(teacher_output, dim=1)
-        loss = -(teacher_probs * student_log_probs).sum(dim=1).mean()
+    def _compute_dino_loss(self, images):
+        if not self.dino_enabled or self.dino_weight == 0:
+            return images.new_zeros(())
 
-        return loss
+        total = images.new_zeros(())
+        terms = 0
+
+        # Each view is created, forwarded, used, and deleted before the next.
+        for _ in range(self.dino_global_views):
+            view = self._make_one_view(images, local=False)
+            with torch.no_grad():
+                teacher_out = self._teacher_dino_output(view)
+            student_out = self._student_dino_output(view)
+            total = total + self.dino_loss(student_out, teacher_out)
+            terms += 1
+            del teacher_out, student_out, view
+
+        for _ in range(self.dino_local_views):
+            view = self._make_one_view(images, local=True)
+            with torch.no_grad():
+                teacher_out = self._teacher_dino_output(view)
+            student_out = self._student_dino_output(view)
+            total = total + self.dino_loss(student_out, teacher_out)
+            terms += 1
+            del teacher_out, student_out, view
+
+        return total / max(terms, 1)
+
+    def _compute_rtdetr_feature_loss(self, teacher_feats, student_feats):
+        total = next(iter(teacher_feats.values())).new_zeros(())
+        for i, idx in enumerate(self.feats_idx):
+            tf = self._as_feature_tensor(teacher_feats[idx]).detach()
+            sf = self.projector[i](self._as_feature_tensor(student_feats[idx]))
+            if sf.shape[-2:] != tf.shape[-2:]:
+                sf = F.interpolate(sf, size=tf.shape[-2:], mode="bilinear", align_corners=False)
+            total = total + F.mse_loss(sf, tf)
+        return total / max(len(self.feats_idx), 1)
+
+    def _compute_yolo_feature_loss(self, teacher_feats, student_feats):
+        head = teacher_feats[self.feats_idx[-1]]
+        teacher_scores = (
+            self.decouple_outputs(head, "one2many")["scores"]
+            + self.decouple_outputs(head, "one2one")["scores"]
+        ) / 2
+        neck = [teacher_feats[i] for i in self.feats_idx[:-1]]
+        parts = torch.split(teacher_scores, [f.shape[-2] * f.shape[-1] for f in neck], dim=-1)
+        scores = tuple(p.sigmoid().max(dim=1, keepdim=True).values for p in parts)
+
+        total = head.new_zeros(())
+        for i, idx in enumerate(self.feats_idx[:-1]):
+            tf = self.decouple_outputs(teacher_feats[idx]).detach()
+            sf = self.projector[i](self.decouple_outputs(student_feats[idx]))
+            total = total + self.loss_sl2(sf, tf, i, scores)
+        return total * self.dis
 
     def loss(self, batch, preds=None):
-        """Compute loss.
+        images = batch["img"]
+        zero = images.new_zeros(())
 
-        Args:
-            batch (dict): Batch to compute loss on.
-            preds (torch.Tensor | list[torch.Tensor], optional): Predictions.
-        """
-        loss_distill = torch.zeros(1, device=batch["img"].device)
-        loss_dino = torch.zeros(1, device=batch["img"].device)
-        if not self.training:  # for loss calculation during validation while training
+        if not self.training:
             if preds is None:
                 preds = self.student_model(batch["img"])
             regular_loss, loss_items = self.student_model.loss(batch, preds)
-            loss_items["dis_loss"] = loss_distill.detach()
-            return torch.cat([regular_loss, loss_distill]), loss_items
+            loss_items["dino_loss"] = zero.detach()
+            loss_items["dis_loss"] = zero.detach()
+            return torch.cat([regular_loss, zero]), loss_items
 
-        # Clear feature dicts before forward passes
         self._teacher_feats.clear()
         self._student_feats.clear()
 
-        with torch.no_grad():
-            self.teacher_model(batch["img"])  # hooks capture teacher features
-        preds = self.student_model(batch["img"])  # hooks capture student features
+        with torch.inference_mode():
+            self.teacher_model(images)
+
+        preds = self.student_model(images)
         regular_loss, loss_items = self.student_model.loss(batch, preds)
-        original_teacher_feats = {
-            idx: feat
-            for idx, feat in self._teacher_feats.items()}
-        original_student_feats = {
-            idx: feat
-            for idx, feat in self._student_feats.items()
-            }
-        #modified
-        global_views, local_views = self.create_dino_views(batch["img"])
-        teacher_dino_views = []
-        for view in global_views:
-            self._teacher_feats.clear()
-            with torch.no_grad():
-                self.teacher_model(view)
-            teacher_feat = self.decouple_outputs(
-                self._teacher_feats[self.feats_idx[-2]]
-            )
-            teacher_dino_views.append(
-                self.dino_teacher_projector(teacher_feat)
-            )
-        student_dino_views = []
-        for view in global_views + local_views:
-            self._student_feats.clear()
-            self.student_model(view)
-            student_feat = self.decouple_outputs(
-                self._student_feats[self.feats_idx[-2]]
-            )
 
-            student_dino_views.append(
-                self.dino_student_projector(student_feat)
-            )
-        loss_dino = torch.zeros(1, device=batch["img"].device)
-        num_terms = 0
-        for teacher_view in teacher_dino_views:
-            for student_view in student_dino_views:
-                loss_dino += self.dino_loss(
-                    student_view,
-                    teacher_view,
-                )
-                num_terms += 1
+        teacher_feats = dict(self._teacher_feats)
+        student_feats = dict(self._student_feats)
 
-        loss_dino = loss_dino / max(num_terms, 1)
-        ##
+        if self.is_rtdetr:
+            loss_distill = self._compute_rtdetr_feature_loss(teacher_feats, student_feats)
+        else:
+            loss_distill = self._compute_yolo_feature_loss(teacher_feats, student_feats)
 
-        teacher_head_feat = original_teacher_feats[self.feats_idx[-1]]
-        teacher_scores = (
-            self.decouple_outputs(teacher_head_feat, branch="one2many")["scores"]
-            + self.decouple_outputs(teacher_head_feat, branch="one2one")["scores"]
-        ) / 2
-        # neck feature sizes vary per batch (e.g. multi_scale), so split scores by the live teacher feats
-        neck_feats = [original_teacher_feats[idx] for idx in self.feats_idx[:-1]]
-        parts = torch.split(teacher_scores, [f.shape[-2] * f.shape[-1] for f in neck_feats], dim=-1)
-        teacher_scores = tuple(p.sigmoid().max(dim=1, keepdim=True).values for p in parts)
-        for i, feat_idx in enumerate(self.feats_idx[:-1]):
-            teacher_feat = self.decouple_outputs(original_teacher_feats[feat_idx])
-            student_feat = self.projector[i](self.decouple_outputs(original_student_feats[feat_idx]))
-            loss_distill += (
-                self.loss_sl2(student_feat, teacher_feat, feat_idx=i, teacher_scores=teacher_scores) * self.dis
-            )
+        loss_dino = self._compute_dino_loss(images) * self.dino_weight
+
+        batch_size = images.shape[0]
+        total_loss = torch.cat([regular_loss]) + (loss_distill + loss_dino) * batch_size
 
         loss_items["dino_loss"] = loss_dino.detach()
         loss_items["dis_loss"] = loss_distill.detach()
-        loss_distill = loss_distill * batch["img"].shape[0]
-        loss_dino = loss_dino * batch["img"].shape[0]
-        return torch.cat(regular_loss), loss_items # 
 
-    def loss_sl2(
-        self, student_feat: torch.Tensor, teacher_feat: torch.Tensor, feat_idx: int, teacher_scores: tuple
-    ) -> torch.Tensor:
-        """Compute score-weighted L2 distillation loss for a feature pair.
+        self._teacher_feats.clear()
+        self._student_feats.clear()
 
-        Args:
-            student_feat (torch.Tensor): Student feature tensor of shape (N, C, H, W).
-            teacher_feat (torch.Tensor): Teacher feature tensor of shape (N, C, H, W).
-            feat_idx (int): Index of the feature level for selecting teacher scores.
-            teacher_scores (tuple): Tuple of score tensors for each feature level.
+        return total_loss, loss_items
 
-        Returns:
-            (torch.Tensor): The computed score-weighted L2 loss.
-        """
-        teacher_score = teacher_scores[feat_idx]
+    def loss_sl2(self, student_feat, teacher_feat, feat_idx, teacher_scores):
+        score = teacher_scores[feat_idx]
         n, c = student_feat.shape[:2]
-        student_feat = student_feat.view(n, c, -1)
-        teacher_feat = teacher_feat.view(n, c, -1)
-        mse = F.mse_loss(student_feat, teacher_feat, reduction="none")
-        weighted_mse = (mse * teacher_score).sum() / (teacher_score.sum() * c + 1e-9)
-        return weighted_mse
+        sf = student_feat.view(n, c, -1)
+        tf = teacher_feat.view(n, c, -1)
+        mse = F.mse_loss(sf, tf, reduction="none")
+        return (mse * score).sum() / (score.sum() * c + 1e-9)
 
     @property
     def criterion(self):
-        """Get the criterion from the student model."""
         return self.student_model.criterion
 
     @criterion.setter
-    def criterion(self, value) -> None:
-        """Set value for student criterion."""
+    def criterion(self, value):
         self.student_model.criterion = value
 
     def init_criterion(self):
-        """Initialize the loss criterion via the student model."""
         return self.student_model.init_criterion()
 
     @property
     def end2end(self):
-        """Expose student end-to-end mode for validator/predictor control."""
         return getattr(self.student_model, "end2end", False)
 
     @end2end.setter
     def end2end(self, value):
-        """Forward end-to-end mode update to the student model."""
         self.student_model.end2end = value
 
     def set_head_attr(self, **kwargs):
-        """Forward head-attribute updates (e.g. max_det, agnostic_nms, end2end) to the student model."""
         self.student_model.set_head_attr(**kwargs)
 
-    def decouple_outputs(self, preds, branch: str = "one2one"):
-        """Decouple outputs for teacher/student models.
-
-        This method handles different output formats from YOLO models, including
-        tuple outputs (train/val mode), dict outputs with branches (one2one/one2many),
-        and direct tensor outputs.
-
-        Args:
-            preds (torch.Tensor | tuple | dict): Model predictions in various formats.
-            branch (str): Which branch to extract from dict outputs ("one2one" or "one2many").
-
-        Returns:
-            (torch.Tensor | dict): The decoupled predictions.
-        """
-        if isinstance(preds, tuple):  # decouple for val mode
+    def decouple_outputs(self, preds, branch="one2one"):
+        if isinstance(preds, tuple):
             preds = preds[1]
         if isinstance(preds, dict) and branch in preds:
             preds = preds[branch]
