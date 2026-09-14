@@ -521,8 +521,13 @@ class DistillationModel(nn.Module):
     def _apply(self, fn):
         """Apply device/dtype transforms to the unregistered teacher modules."""
         super()._apply(fn)
-        self.teacher_model._apply(fn)
-        self.dino_teacher_projector._apply(fn)
+
+        if self.teacher_model is not None:
+            self.teacher_model._apply(fn)
+
+        if self.dino_teacher_projector is not None:
+            self.dino_teacher_projector._apply(fn)
+
         return self
 
     def forward(self, x, *args, **kwargs):
