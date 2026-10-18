@@ -1,4 +1,4 @@
-# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# Ultralytics ðŸš€ AGPL-3.0 License - https://ultralytics.com/license
 """
 Train a model on a dataset.
 
@@ -306,6 +306,25 @@ class BaseTrainer:
             rank=LOCAL_RANK,
             mode="val",
         )
+        # Optional independent Dataset B loader for frozen Teacher-B feature distillation.
+        self.distill_loader = None
+        self.distill_iterator = None
+        if getattr(self.args, "distill_model", None) and getattr(self.args, "distill_data", None):
+            distill_yaml = check_det_dataset(self.args.distill_data)
+            main_data = self.data
+            try:
+                # Dataset construction reads self.data for class names/channels.
+                # Swap only while building Dataset B; restore before training Dataset A.
+                self.data = distill_yaml
+                self.distill_loader = self.get_dataloader(
+                    distill_yaml["train"], batch_size=batch_size, rank=LOCAL_RANK, mode="train"
+                )
+            finally:
+                self.data = main_data
+            self.distill_iterator = iter(self.distill_loader)
+            LOGGER.info(
+                f"Two-teacher distillation enabled: Dataset B has {len(self.distill_loader.dataset)} images."
+            )
         self.accumulate = max(round(self.args.nbs / self.batch_size), 1)  # accumulate loss before optimizing
         weight_decay = self.args.weight_decay * self.batch_size * self.accumulate / self.args.nbs  # scale weight_decay
         iterations = math.ceil(len(self.train_loader.dataset) / max(self.batch_size, self.args.nbs)) * self.epochs
@@ -352,8 +371,8 @@ class BaseTrainer:
 
         # Compile model (knowledge distillation runs the wrapped model eagerly and relies on
         # find_unused_parameters under DDP for the frozen teacher, so disable compilation when distilling)
-        if self.args.distill_model is not None and self.args.compile:
-            LOGGER.warning("'compile' is not supported with knowledge distillation and will be disabled.")
+        if (self.args.distill_model is not None or self.args.dino_distill) and self.args.compile:
+            LOGGER.warning("'compile' is not supported with two-teacher distillation and will be disabled.")
             self.args.compile = False
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
 
@@ -412,8 +431,10 @@ class BaseTrainer:
                 else torch.cuda.amp.GradScaler(enabled=self.amp and self.args.amp != "bf16")
             )
         # resume training would directly load DistillationModel so check here
-        if ((self.args.distill_model is not None or self.args.dino_distill)and not isinstance(unwrap_model(self.model), DistillationModel)):
-            self.model = DistillationModel(student_model=self.model,teacher_model=self.args.distill_model,)
+        if (self.args.distill_model is not None or self.args.dino_distill) and not isinstance(unwrap_model(self.model), DistillationModel):
+            if self.args.distill_model and not getattr(self.args, "distill_data", None):
+                raise ValueError("Teacher B requires distill_data=path/to/teacher_dataset.yaml")
+            self.model = DistillationModel(student_model=self.model, teacher_model=self.args.distill_model)
         if self.world_size > 1:
             # static_graph=True permits params used >1 time per forward (e.g. flow_model in
             # o2m+o2o pose loss branches) under torch.compile.
@@ -480,6 +501,10 @@ class BaseTrainer:
             self._model_train()
             if RANK != -1:
                 self.train_loader.sampler.set_epoch(epoch)
+            if self.distill_loader is not None:
+                if RANK != -1 and hasattr(self.distill_loader, "sampler"):
+                    self.distill_loader.sampler.set_epoch(epoch)
+                self.distill_iterator = iter(self.distill_loader)
             pbar = enumerate(self.train_loader)
             # Update dataloader attributes (optional)
             if epoch == (self.epochs - self.args.close_mosaic):
@@ -517,6 +542,16 @@ class BaseTrainer:
                 try:
                     with autocast(torch.bfloat16 if self.args.amp == "bf16" else self.amp, device=self.device.type):
                         batch = self.preprocess_batch(batch)
+                        if self.distill_loader is not None:
+                            try:
+                                distill_batch = next(self.distill_iterator)
+                            except StopIteration:
+                                if RANK != -1 and hasattr(self.distill_loader, "sampler"):
+                                    self.distill_loader.sampler.set_epoch(epoch)
+                                self.distill_iterator = iter(self.distill_loader)
+                                distill_batch = next(self.distill_iterator)
+                            distill_batch = self.preprocess_batch(distill_batch)
+                            batch["teacher_img"] = distill_batch["img"]
                         if self.args.compile:
                             # Decouple inference and loss calculations for improved compile performance
                             preds = self.model(batch["img"])
@@ -771,7 +806,7 @@ class BaseTrainer:
                 "ema": ema,
                 "updates": self.ema.updates,
                 "dino_teacher": (
-                    unwrap_model(self.model).teacher_model.state_dict()
+                    unwrap_model(self.model).teacher_a.state_dict()
                     if isinstance(unwrap_model(self.model), DistillationModel)
                         and unwrap_model(self.model).self_distill
                     else None),
@@ -830,7 +865,7 @@ class BaseTrainer:
                 if "yaml_file" in data:
                     self.args.data = data["yaml_file"]  # for validating 'yolo train data=url.zip' usage
         except Exception as e:
-            raise RuntimeError(emojis(f"Dataset '{clean_url(self.args.data)}' error ❌ {e}")) from e
+            raise RuntimeError(emojis(f"Dataset '{clean_url(self.args.data)}' error âŒ {e}")) from e
         if self.args.single_cls:
             LOGGER.info("Overriding class names with single class.")
             data["names"] = {0: "item"}
@@ -863,8 +898,7 @@ class BaseTrainer:
             student_model = self.get_model(cfg=cfg, weights=weights.student_model, verbose=RANK in {-1, 0})
             student_model.args = self.args
             # teacher is stripped from the checkpoint to save memory/disk; rebuild it from the distill_model path
-            teacher_model = weights.teacher_model if weights.teacher_model is not None else self.args.distill_model
-            model = DistillationModel(student_model=student_model, teacher_model=teacher_model)
+            model = DistillationModel(student_model=student_model, teacher_model=self.args.distill_model)
             if getattr(weights, "projector", None) is not None:
                 model.projector.load_state_dict(weights.projector.state_dict())  # restore the trained projector
             model.criterion = None
@@ -1050,7 +1084,7 @@ class BaseTrainer:
             self.ema.updates = ckpt["updates"]
         model = unwrap_model(self.model)
         if (ckpt.get("dino_teacher") is not None and isinstance(model, DistillationModel) and model.self_distill):
-            model.teacher_model.load_state_dict(ckpt["dino_teacher"])
+            model.teacher_a.load_state_dict(ckpt["dino_teacher"])
             model._freeze_teacher()
         self.best_fitness = ckpt.get("best_fitness")
 
