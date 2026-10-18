@@ -1,4 +1,4 @@
-# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+# Ultralytics ðŸš€ AGPL-3.0 License - https://ultralytics.com/license
 from __future__ import annotations
 
 from pathlib import Path
@@ -79,192 +79,110 @@ class DistillationModel(nn.Module):
         teacher_model: str | Path | nn.Module | None,
         student_model: nn.Module,
     ):
-        super().__init__()
+        """Build two independent teachers: EMA Teacher A and frozen Teacher B.
 
+        Teacher A is a copy of the student and is used only for DINO-style
+        self-distillation on Dataset A. Teacher B is loaded from a checkpoint
+        and is used only for feature distillation on Dataset B.
+        """
+        super().__init__()
         ch = student_model.yaml.get("channels", 3)
         device = next(student_model.parameters()).device
-
         self.student_model = student_model
         self.student_model.train()
         self.student_model.requires_grad_(True)
+        self.self_distill = bool(student_model.args.get("dino_distill", True))
+        if not self.self_distill:
+            raise ValueError("Two-teacher mode requires dino_distill=True for EMA Teacher A.")
 
-        self.self_distill = bool(student_model.args.get("dino_distill", False))
+        # Both teachers deliberately remain outside nn.Module._modules so the
+        # optimizer and ModelEMA only track the student and trainable projectors.
+        teacher_a = deepcopy(student_model).to(device)
+        teacher_a.eval().requires_grad_(False)
+        object.__setattr__(self, "teacher_a", teacher_a)
+        # Backward-compatible alias used by existing checkpoint code.
+        object.__setattr__(self, "teacher_model", teacher_a)
 
-        # If dino_distill=True and no external teacher is supplied, use an
-        # EMA teacher initialized as an exact copy of the student.
-        if self.self_distill:
-            # Keep the EMA teacher outside nn.Module._modules. Ultralytics'
-            # optimizer builder may otherwise include frozen teacher params.
-            object.__setattr__(
-                self,
-                "teacher_model",
-                deepcopy(student_model).to(device),
-            )
+        if isinstance(teacher_model, (str, Path)):
+            teacher_b = load_checkpoint(teacher_model)[0]
         else:
-            if teacher_model is None:
+            teacher_b = teacher_model
+        if teacher_b is not None:
+            teacher_b = teacher_b.to(device)
+            if teacher_b.yaml.get("channels", 3) != ch:
                 raise ValueError(
-                    "A teacher checkpoint/model is required when dino_distill=False."
+                    f"Teacher B expects {teacher_b.yaml.get('channels', 3)} input channels, "
+                    f"but the student expects {ch}. Provide a compatible checkpoint."
                 )
-
-            if isinstance(teacher_model, (str, Path)):
-                teacher_model = load_checkpoint(teacher_model)[0]
-
-                # Keep the input channel count compatible with the student.
-                if teacher_model.yaml.get("channels", 3) != ch:
-                    weights = teacher_model
-                    teacher_model = type(weights)(
-                        weights.yaml.copy(),
-                        ch=ch,
-                        nc=weights.yaml["nc"],
-                        verbose=False,
-                    )
-                    teacher_model.load(weights)
-
-            object.__setattr__(self, "teacher_model", teacher_model.to(device))
+        object.__setattr__(self, "teacher_b", teacher_b)
 
         self.model_type = self._detect_model_type(student_model)
-
+        if self.model_type != "yolo":
+            raise ValueError("This generated two-teacher configuration is intended for YOLO Detect models.")
         self._freeze_teacher()
 
-        # Feature layers differ between YOLO Detect and RT-DETR.
         self.feats_idx = self.get_distill_layers(student_model)
+        self.teacher_b_feats_idx = self.get_distill_layers(teacher_b) if teacher_b is not None else []
+        if teacher_b is not None and len(self.feats_idx) != len(self.teacher_b_feats_idx):
+            raise ValueError(
+                "Student and Teacher B must expose the same number of Detect input feature maps. "
+                f"Got {len(self.feats_idx)} and {len(self.teacher_b_feats_idx)}."
+            )
 
-        self._teacher_feats: dict[int, object] = {}
+        self._teacher_feats: dict[int, object] = {}       # Teacher A / DINO
+        self._teacher_b_feats: dict[int, object] = {}     # Teacher B / feature KD
         self._student_feats: dict[int, object] = {}
         self._teacher_hooks: list = []
+        self._teacher_b_hooks: list = []
         self._student_hooks: list = []
-
         self._register_feature_hooks()
 
-        # ------------------------------------------------------------
-        # Infer feature dimensions with a dummy forward.
-        # ------------------------------------------------------------
         imgsz = student_model.args.get("imgsz", 640)
         if isinstance(imgsz, (list, tuple)):
             imgsz_h, imgsz_w = int(imgsz[0]), int(imgsz[1])
         else:
             imgsz_h = imgsz_w = int(imgsz)
-
         student_model.eval()
-
         with torch.no_grad():
-            im = torch.zeros(
-                2,
-                ch,
-                imgsz_h,
-                imgsz_w,
-                device=device,
-            )
-
-            self._teacher_feats.clear()
-            self._student_feats.clear()
-
-            self.teacher_model(im)
+            im = torch.zeros(2, ch, imgsz_h, imgsz_w, device=device)
+            self._teacher_feats.clear(); self._teacher_b_feats.clear(); self._student_feats.clear()
+            self.teacher_a(im)
+            if teacher_b is not None:
+                teacher_b(im)
             student_model(im)
-
         student_model.train()
 
-        teacher_output = [self._as_feature(self._teacher_feats[idx]) for idx in self.feats_idx]
         student_output = [self._as_feature(self._student_feats[idx]) for idx in self.feats_idx]
-
+        teacher_a_output = [self._as_feature(self._teacher_feats[idx]) for idx in self.feats_idx]
+        teacher_b_output = [self._as_feature(self._teacher_b_feats[idx]) for idx in self.teacher_b_feats_idx] if teacher_b is not None else []
         copy_attr(self, student_model)
-
-        # Main feature-distillation weight.
         self.dis = float(self.student_model.args.get("dis", 6.0))
+        self.dino_weight = float(self.student_model.args.get("dino_weight", 1.0))
 
-        # DINO loss weight. If not explicitly supplied, keep it modest so
-        # detection loss remains dominant.
-        self.dino_weight = float(
-            self.student_model.args.get("dino_weight", 1.0)
-        )
-
-        # ------------------------------------------------------------
-        # Feature projectors.
-        # Every selected layer is a real [B,C,H,W] feature map.
-        # ------------------------------------------------------------
+        # Project student features to Teacher B channel dimensions.
         projectors = []
-
-        # Both YOLO and RT-DETR use all selected feature maps for feature KD.
-        # The detection head/decoder itself is deliberately excluded from
-        # self.feats_idx, so there is no need for a special final-layer case.
-        projector_pairs = zip(student_output, teacher_output)
-
-        for student_out, teacher_out in projector_pairs:
-            student_dim = student_out.shape[1]
-            teacher_dim = teacher_out.shape[1]
-
-            if student_dim == teacher_dim:
-                projectors.append(nn.Identity())
-            else:
-                projectors.append(
-                    nn.Sequential(
-                        nn.Conv2d(
-                            student_dim,
-                            teacher_dim,
-                            kernel_size=1,
-                            stride=1,
-                            padding=0,
-                        ),
-                        nn.ReLU(inplace=True),
-                        nn.Conv2d(
-                            teacher_dim,
-                            teacher_dim,
-                            kernel_size=1,
-                            stride=1,
-                            padding=0,
-                        ),
-                    )
-                )
-
+        for student_out, teacher_out in zip(student_output, teacher_b_output):
+            sd, td = student_out.shape[1], teacher_out.shape[1]
+            projectors.append(nn.Identity() if sd == td else nn.Sequential(
+                nn.Conv2d(sd, td, kernel_size=1), nn.ReLU(inplace=True),
+                nn.Conv2d(td, td, kernel_size=1),
+            ))
         self.projector = nn.ModuleList(projectors).to(device)
 
-        # ------------------------------------------------------------
-        # DINO feature selection.
-        # YOLO26:  [16, 19, 22] -> layer 22 (deepest Detect input)
-        # RT-DETR: [21, 24, 27] -> layer 24 (middle multiscale feature)
-        # ------------------------------------------------------------
-        if self.model_type == "yolo":
-            dino_index = len(student_output) - 1
-        elif self.model_type == "rtdetr":
-            dino_index = len(student_output) // 2
-        else:
-            raise ValueError(
-                f"Unsupported model type for DINO: {self.model_type}"
-            )
-
-        dino_student_feat = student_output[dino_index]
-        dino_teacher_feat = teacher_output[dino_index]
-
+        # DINO always uses Teacher A, which has the same architecture as Student.
+        dino_index = len(student_output) - 1
         self.dino_feature_idx = self.feats_idx[dino_index]
-
         self.dino_student_projector = DINOHead(
-            dino_student_feat.shape[1],
-            hidden_dim=512,
-            bottleneck_dim=256,
-            out_dim=1024,
+            student_output[dino_index].shape[1], hidden_dim=512, bottleneck_dim=256, out_dim=1024
         ).to(device)
-
-        _dino_teacher_projector = DINOHead(
-            dino_teacher_feat.shape[1],
-            hidden_dim=512,
-            bottleneck_dim=256,
-            out_dim=1024,
+        teacher_projector = DINOHead(
+            teacher_a_output[dino_index].shape[1], hidden_dim=512, bottleneck_dim=256, out_dim=1024
         ).to(device)
-
-        _dino_teacher_projector.load_state_dict(
-            self.dino_student_projector.state_dict()
-        )
-
-        object.__setattr__(self, "dino_teacher_projector", _dino_teacher_projector)
-
+        teacher_projector.load_state_dict(self.dino_student_projector.state_dict())
+        object.__setattr__(self, "dino_teacher_projector", teacher_projector)
         for param in self.dino_teacher_projector.parameters():
-            param.requires_grad = False
-
-        self.register_buffer(
-            "dino_center",
-            torch.zeros(1, 1024, device=device),
-        )
-
+            param.requires_grad_(False)
+        self.register_buffer("dino_center", torch.zeros(1, 1024, device=device))
         self.dino_center_momentum = 0.9
 
     # ------------------------------------------------------------------
@@ -333,109 +251,60 @@ class DistillationModel(nn.Module):
 
     @torch.no_grad()
     def update_teacher(self):
-        """
-        EMA-update the self-distillation teacher.
-
-        For an externally supplied teacher checkpoint, this does nothing.
-        """
-
-        if not self.self_distill or self.teacher_model is None:
+        """EMA-update Teacher A exactly once after each optimizer step."""
+        if not self.self_distill:
             return
-
-        momentum = float(
-            self.student_model.args.get("distill_momentum", 0.996)
-        )
-
-        for teacher_param, student_param in zip(
-            self.teacher_model.parameters(),
-            self.student_model.parameters(),
-        ):
-            teacher_param.mul_(momentum).add_(
-                student_param,
-                alpha=1.0 - momentum,
-            )
-
-        # Copy buffers (BN running statistics etc.).
-        for teacher_buffer, student_buffer in zip(
-            self.teacher_model.buffers(),
-            self.student_model.buffers(),
-        ):
-            teacher_buffer.copy_(student_buffer)
-
-        # EMA-update the DINO teacher projection head too.
-        for teacher_param, student_param in zip(
-            self.dino_teacher_projector.parameters(),
-            self.dino_student_projector.parameters(),
-        ):
-            teacher_param.mul_(momentum).add_(
-                student_param,
-                alpha=1.0 - momentum,
-            )
+        momentum = float(self.student_model.args.get("distill_momentum", 0.996))
+        for tp, sp in zip(self.teacher_a.parameters(), self.student_model.parameters()):
+            tp.mul_(momentum).add_(sp, alpha=1.0 - momentum)
+        for tb, sb in zip(self.teacher_a.buffers(), self.student_model.buffers()):
+            tb.copy_(sb)
+        for tp, sp in zip(self.dino_teacher_projector.parameters(), self.dino_student_projector.parameters()):
+            tp.mul_(momentum).add_(sp, alpha=1.0 - momentum)
+        self.teacher_a.eval()
+        if self.teacher_b is not None:
+            self.teacher_b.eval()
 
     def _freeze_teacher(self):
-        """Keep the detection teacher frozen."""
-
-        if self.teacher_model is None:
-            return
-
-        self.teacher_model.eval()
-
-        for param in self.teacher_model.parameters():
-            param.requires_grad_(False)
+        """Keep both teachers frozen and in evaluation mode."""
+        for name in ("teacher_a", "teacher_b"):
+            teacher = getattr(self, name, None)
+            if teacher is not None:
+                teacher.eval()
+                for param in teacher.parameters():
+                    param.requires_grad_(False)
 
     # ------------------------------------------------------------------
     # Feature hooks
     # ------------------------------------------------------------------
 
     def _register_feature_hooks(self) -> None:
-        """Register feature hooks on both student and teacher."""
-
+        """Register independent hooks for Student, Teacher A and Teacher B."""
         self._remove_feature_hooks()
-
         for idx in self.feats_idx:
             if idx < 0 or idx >= len(self.student_model.model):
-                raise IndexError(
-                    f"Student feature layer index {idx} is outside model range."
-                )
-
+                raise IndexError(f"Student feature layer index {idx} is outside model range.")
             self._clear_feature_hooks(self.student_model.model[idx])
-            self._student_hooks.append(
-                self.student_model.model[idx].register_forward_hook(
-                    FeatureHook(self._student_feats, idx)
-                )
-            )
-
-            if self.teacher_model is not None:
-                if idx >= len(self.teacher_model.model):
-                    raise IndexError(
-                        f"Teacher feature layer index {idx} is outside model range."
-                    )
-
-                self._clear_feature_hooks(self.teacher_model.model[idx])
-                self._teacher_hooks.append(
-                    self.teacher_model.model[idx].register_forward_hook(
-                        FeatureHook(self._teacher_feats, idx)
-                    )
-                )
+            self._student_hooks.append(self.student_model.model[idx].register_forward_hook(FeatureHook(self._student_feats, idx)))
+            if idx >= len(self.teacher_a.model):
+                raise IndexError(f"Teacher A feature layer index {idx} is outside model range.")
+            self._clear_feature_hooks(self.teacher_a.model[idx])
+            self._teacher_hooks.append(self.teacher_a.model[idx].register_forward_hook(FeatureHook(self._teacher_feats, idx)))
+        if self.teacher_b is not None:
+            for idx in self.teacher_b_feats_idx:
+                if idx < 0 or idx >= len(self.teacher_b.model):
+                    raise IndexError(f"Teacher B feature layer index {idx} is outside model range.")
+                self._clear_feature_hooks(self.teacher_b.model[idx])
+                self._teacher_b_hooks.append(self.teacher_b.model[idx].register_forward_hook(FeatureHook(self._teacher_b_feats, idx)))
 
     def _remove_feature_hooks(self) -> None:
-        """Remove previously registered feature hooks."""
-
-        for handle in self._student_hooks:
-            handle.remove()
-
-        self._student_hooks.clear()
-
-        if self.teacher_model is not None:
-            for handle in self._teacher_hooks:
+        for handles in (self._student_hooks, self._teacher_hooks, self._teacher_b_hooks):
+            for handle in handles:
                 handle.remove()
-
-            self._teacher_hooks.clear()
+            handles.clear()
 
     @staticmethod
     def _clear_feature_hooks(module: nn.Module) -> None:
-        """Remove stale FeatureHook instances."""
-
         for handle_id, hook in list(module._forward_hooks.items()):
             if isinstance(hook, FeatureHook):
                 del module._forward_hooks[handle_id]
@@ -488,10 +357,12 @@ class DistillationModel(nn.Module):
         """Remove live tensors/hooks before pickling."""
 
         self._teacher_feats.clear()
+        self._teacher_b_feats.clear()
         self._student_feats.clear()
 
         state = self.__dict__.copy()
         state["_teacher_hooks"] = []
+        state["_teacher_b_hooks"] = []
         state["_student_hooks"] = []
 
         return state
@@ -502,7 +373,11 @@ class DistillationModel(nn.Module):
         self.__dict__.update(state)
 
         self._teacher_feats = {}
+        self._teacher_b_feats = {}
         self._student_feats = {}
+        self._teacher_hooks = []
+        self._teacher_b_hooks = []
+        self._student_hooks = []
 
         self._register_feature_hooks()
 
@@ -511,23 +386,18 @@ class DistillationModel(nn.Module):
     # ------------------------------------------------------------------
 
     def train(self, mode: bool = True):
-        """Set train mode while forcing the detection teacher to eval mode."""
-
+        """Train student/projectors while forcing both teachers to eval mode."""
         super().train(mode)
         self._freeze_teacher()
-
         return self
 
     def _apply(self, fn):
-        """Apply device/dtype transforms to the unregistered teacher modules."""
+        """Apply device/dtype transforms to unregistered teacher modules."""
         super()._apply(fn)
-
-        if self.teacher_model is not None:
-            self.teacher_model._apply(fn)
-
-        if self.dino_teacher_projector is not None:
-            self.dino_teacher_projector._apply(fn)
-
+        for name in ("teacher_a", "teacher_b", "dino_teacher_projector"):
+            module = getattr(self, name, None)
+            if module is not None:
+                module._apply(fn)
         return self
 
     def forward(self, x, *args, **kwargs):
@@ -883,242 +753,94 @@ class DistillationModel(nn.Module):
     # ------------------------------------------------------------------
 
     def loss(self, batch, preds=None):
+        """Train with Dataset A detection+DINO and Dataset B Teacher-B feature KD.
+
+        Training batch keys:
+          img: Dataset A images with labels for the normal detection loss.
+          teacher_img: required when Teacher B is configured; independently sampled
+                       Dataset B images. Dataset B labels are intentionally unused by feature KD.
         """
-        Compute:
+        images_a = batch["img"]
+        device = images_a.device
+        loss_distill = torch.zeros(1, device=device)
+        loss_dino = torch.zeros(1, device=device)
 
-            L_total =
-                L_detection
-                + dis * L_feature
-                + dino_weight * L_DINO
-
-        YOLO:
-            L_feature is multiscale feature MSE on Detect input features.
-
-        RT-DETR:
-            L_feature is architecture-agnostic multiscale feature MSE.
-        """
-
-        device = batch["img"].device
-
-        loss_distill = torch.zeros(
-            1,
-            device=device,
-        )
-
-        loss_dino = torch.zeros(
-            1,
-            device=device,
-        )
-
-        # ------------------------------------------------------------
-        # Validation / evaluation.
-        #
-        # Do not run the expensive teacher + DINO pipeline here.
-        # ------------------------------------------------------------
+        # Validation stays standard student-only validation on Dataset A.
         if not self.training:
             if preds is None:
-                preds = self.student_model(batch["img"])
-
-            regular_loss, loss_items = self.student_model.loss(
-                batch,
-                preds,
-            )
-
+                preds = self.student_model(images_a)
+            regular_loss, loss_items = self.student_model.loss(batch, preds)
             if isinstance(loss_items, dict):
                 loss_items["dino_loss"] = loss_dino.detach()
                 loss_items["dis_loss"] = loss_distill.detach()
-
             return self._combine_detection_and_distill_loss(
-                regular_loss,
-                loss_distill,
-                loss_dino,
-                batch["img"].shape[0],
+                regular_loss, loss_distill, loss_dino, images_a.shape[0]
             ), loss_items
 
-        # ------------------------------------------------------------
-        # EMA teacher update for self-distillation.
-        #
-        # This happens before the teacher forward, so the teacher uses
-        # the previous/EMA student state.
-        # ------------------------------------------------------------
-        if self.self_distill:
-            self.update_teacher()
+        if self.teacher_b is not None and "teacher_img" not in batch:
+            raise KeyError(
+                "Teacher B is configured but batch['teacher_img'] is missing. Configure distill_data "
+                "and build the second dataloader in trainer.py."
+            )
 
-        # ------------------------------------------------------------
-        # Clear hook storage.
-        # ------------------------------------------------------------
+        # Dataset A: Teacher A target + supervised student prediction.
         self._teacher_feats.clear()
         self._student_feats.clear()
-
-        # ------------------------------------------------------------
-        # Teacher forward.
-        # ------------------------------------------------------------
         with torch.no_grad():
-            self.teacher_model(batch["img"])
+            self.teacher_a(images_a)
+        preds = self.student_model(images_a)
+        regular_loss, loss_items = self.student_model.loss(batch, preds)
+        teacher_a_feats = {idx: self._as_feature(v) for idx, v in self._teacher_feats.items()}
 
-        # ------------------------------------------------------------
-        # Student forward.
-        # ------------------------------------------------------------
-        preds = self.student_model(batch["img"])
-
-        regular_loss, loss_items = self.student_model.loss(
-            batch,
-            preds,
-        )
-
-        # Clone references to the original feature tensors.
-        original_teacher_feats = {
-            idx: self._as_feature(feat)
-            for idx, feat in self._teacher_feats.items()
-        }
-
-        original_student_feats = {
-            idx: self._as_feature(feat)
-            for idx, feat in self._student_feats.items()
-        }
-
-        # ============================================================
-        # DINO DISTILLATION
-        # ============================================================
-
-        global_views, local_views = self.create_dino_views(
-            batch["img"]
-        )
-
+        # DINO: only Teacher A is used here. Teacher B is never used for DINO.
+        global_views, local_views = self.create_dino_views(images_a)
         teacher_dino_views = []
-
         for view in global_views:
             self._teacher_feats.clear()
-
             with torch.no_grad():
-                self.teacher_model(view)
-
-            teacher_feat = self._as_feature(
-                self._teacher_feats[self.dino_feature_idx]
-            )
-
-            teacher_dino_views.append(
-                self.dino_teacher_projector(teacher_feat)
-            )
-
+                self.teacher_a(view)
+            feat = self._as_feature(self._teacher_feats[self.dino_feature_idx])
+            teacher_dino_views.append(self.dino_teacher_projector(feat))
         student_dino_views = []
-
         for view in global_views + local_views:
             self._student_feats.clear()
-
             self.student_model(view)
-
-            student_feat = self._as_feature(
-                self._student_feats[self.dino_feature_idx]
-            )
-
-            student_dino_views.append(
-                self.dino_student_projector(student_feat)
-            )
-
+            feat = self._as_feature(self._student_feats[self.dino_feature_idx])
+            student_dino_views.append(self.dino_student_projector(feat))
         num_terms = 0
-
         for teacher_view in teacher_dino_views:
             for student_view in student_dino_views:
-                loss_dino += self.dino_loss(
-                    student_view,
-                    teacher_view,
-                )
-
+                loss_dino = loss_dino + self.dino_loss(student_view, teacher_view)
                 num_terms += 1
+        loss_dino = loss_dino / max(num_terms, 1)
 
-        loss_dino = loss_dino / max(
-            num_terms,
-            1,
-        )
-
-        # ============================================================
-        # FEATURE DISTILLATION
-        # ============================================================
-
-        if self.model_type == "yolo":
-            # --------------------------------------------------------
-            # YOLO feature distillation.
-            # --------------------------------------------------------
-            # Only the feature maps feeding Detect are distilled. The Detect
-            # head output is intentionally excluded from self.feats_idx.
-            # Use the same normalized feature MSE as RT-DETR here so the
-            # distillation target is a genuine [B,C,H,W] representation.
-            # --------------------------------------------------------
-            for i, feat_idx in enumerate(self.feats_idx):
-                teacher_feat = self._as_feature(
-                    original_teacher_feats[feat_idx]
+        # Dataset B: the same B images pass through frozen Teacher B and Student.
+        # Clear hooks so no Dataset A features can leak into this loss.
+        if self.teacher_b is not None:
+            images_b = batch["teacher_img"]
+            self._teacher_b_feats.clear()
+            self._student_feats.clear()
+            with torch.no_grad():
+                self.teacher_b(images_b)
+            self.student_model(images_b)
+            teacher_b_feats = {idx: self._as_feature(v) for idx, v in self._teacher_b_feats.items()}
+            student_b_feats = {idx: self._as_feature(v) for idx, v in self._student_feats.items()}
+            for i, (student_idx, teacher_idx) in enumerate(zip(self.feats_idx, self.teacher_b_feats_idx)):
+                student_feat = self.projector[i](student_b_feats[student_idx])
+                teacher_feat = teacher_b_feats[teacher_idx]
+                loss_distill = loss_distill + self.loss_sl2(
+                    student_feat, teacher_feat, feat_idx=i, teacher_scores=None
                 )
+            # Apply feature weight once, rather than multiplying each layer and then
+            # again in the trainer.
+            loss_distill = loss_distill * self.dis
 
-                student_feat = self.projector[i](
-                    self._as_feature(
-                        original_student_feats[feat_idx]
-                    )
-                )
-
-                loss_distill += (
-                    self.loss_sl2(
-                        student_feat,
-                        teacher_feat,
-                        feat_idx=i,
-                        teacher_scores=None,
-                    )
-                    * self.dis
-                )
-
-        elif self.model_type == "rtdetr":
-            # --------------------------------------------------------
-            # RT-DETR feature distillation.
-            #
-            # There is no YOLO one2many/one2one score tensor here.
-            # Distill the multiscale feature maps directly.
-            # --------------------------------------------------------
-            for i, feat_idx in enumerate(
-                self.feats_idx
-            ):
-                teacher_feat = self._as_feature(
-                    original_teacher_feats[feat_idx]
-                )
-
-                student_feat = self.projector[i](
-                    self._as_feature(
-                        original_student_feats[feat_idx]
-                    )
-                )
-
-                loss_distill += (
-                    self.loss_sl2(
-                        student_feat,
-                        teacher_feat,
-                        feat_idx=i,
-                        teacher_scores=None,
-                    )
-                    * self.dis
-                )
-
-        # ------------------------------------------------------------
-        # Logging.
-        # ------------------------------------------------------------
         if isinstance(loss_items, dict):
             loss_items["dino_loss"] = loss_dino.detach()
             loss_items["dis_loss"] = loss_distill.detach()
-
-        # ------------------------------------------------------------
-        # IMPORTANT:
-        #
-        # The previous implementation computed loss_dino and
-        # loss_distill but returned only the detection loss.
-        #
-        # This version explicitly adds both terms to the optimization
-        # loss.
-        # ------------------------------------------------------------
         total_loss = self._combine_detection_and_distill_loss(
-            regular_loss,
-            loss_distill,
-            loss_dino,
-            batch["img"].shape[0],
+            regular_loss, loss_distill, loss_dino, images_a.shape[0]
         )
-
         return total_loss, loss_items
 
     def _combine_detection_and_distill_loss(
