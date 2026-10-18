@@ -99,10 +99,12 @@ weight_decay: 0.0005 # (float) weight decay (L2 regularization)
 warmup_epochs: 3.0 # (float) warmup epochs (fractions allowed)
 warmup_momentum: 0.8 # (float) initial momentum during warmup
 warmup_bias_lr: 0.1 # (float) bias learning rate during warmup
-distill_model: # (str, optional) path to teacher model for knowledge distillation
-dino_distill: true # (bool) enabled EMA self-distillation  08-09-2026
-distill_momentum: 0.996 # (float) EMA teacher momentum
-dis: 6.0 # (float) distillation loss weight
+distill_model: # (str, optional) path to frozen Teacher B checkpoint (e.g. YOLO26-L best.pt)
+distill_data: # (str, optional) Dataset B YAML; independent images for Teacher-B feature distillation
+dino_distill: true # (bool) enable EMA Teacher A DINO-style self-distillation on Dataset A
+distill_momentum: 0.996 # (float) EMA momentum for Teacher A only
+dino_weight: 1.0 # (float) DINO-style loss weight for Teacher A
+dis: 6.0 # (float) feature-distillation loss weight for Teacher B
 box: 7.5 # (float) box loss gain
 cls: 0.5 # (float) classification loss gain
 cls_pw: 0.0 # (float) class weights power for handling class imbalance (0.0=disable, 1.0=full inverse frequency)
