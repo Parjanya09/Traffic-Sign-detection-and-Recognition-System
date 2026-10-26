@@ -309,7 +309,11 @@ class BaseTrainer:
         # Optional independent Dataset B loader for frozen Teacher-B feature distillation.
         self.distill_loader = None
         self.distill_iterator = None
-        if getattr(self.args, "distill_model", None) and getattr(self.args, "distill_data", None):
+        if (
+            getattr(self.args, "l2_distill", True)
+            and getattr(self.args, "distill_model", None)
+            and getattr(self.args, "distill_data", None)
+        ):
             distill_yaml = check_det_dataset(self.args.distill_data)
             main_data = self.data
             try:
@@ -371,7 +375,7 @@ class BaseTrainer:
 
         # Compile model (knowledge distillation runs the wrapped model eagerly and relies on
         # find_unused_parameters under DDP for the frozen teacher, so disable compilation when distilling)
-        if (self.args.distill_model is not None or self.args.dino_distill) and self.args.compile:
+        if (self.args.dino_distill or getattr(self.args, "l2_distill", True)) and self.args.compile:
             LOGGER.warning("'compile' is not supported with two-teacher distillation and will be disabled.")
             self.args.compile = False
         self.model = attempt_compile(self.model, device=self.device, mode=self.args.compile)
@@ -431,10 +435,14 @@ class BaseTrainer:
                 else torch.cuda.amp.GradScaler(enabled=self.amp and self.args.amp != "bf16")
             )
         # resume training would directly load DistillationModel so check here
-        if (self.args.distill_model is not None or self.args.dino_distill) and not isinstance(unwrap_model(self.model), DistillationModel):
-            if self.args.distill_model and not getattr(self.args, "distill_data", None):
-                raise ValueError("Teacher B requires distill_data=path/to/teacher_dataset.yaml")
-            self.model = DistillationModel(student_model=self.model, teacher_model=self.args.distill_model)
+        if (self.args.dino_distill or getattr(self.args, "l2_distill", True)) and not isinstance(unwrap_model(self.model), DistillationModel):
+            l2_enabled = bool(getattr(self.args, "l2_distill", True))
+            if l2_enabled and not self.args.distill_model:
+                raise ValueError("l2_distill=True requires distill_model=path/to/TeacherB_best.pt")
+            if l2_enabled and not getattr(self.args, "distill_data", None):
+                raise ValueError("l2_distill=True requires distill_data=path/to/dataset_B.yaml")
+            teacher_b_path = self.args.distill_model if l2_enabled else None
+            self.model = DistillationModel(student_model=self.model, teacher_model=teacher_b_path)
         if self.world_size > 1:
             # static_graph=True permits params used >1 time per forward (e.g. flow_model in
             # o2m+o2o pose loss branches) under torch.compile.
@@ -898,7 +906,8 @@ class BaseTrainer:
             student_model = self.get_model(cfg=cfg, weights=weights.student_model, verbose=RANK in {-1, 0})
             student_model.args = self.args
             # teacher is stripped from the checkpoint to save memory/disk; rebuild it from the distill_model path
-            model = DistillationModel(student_model=student_model, teacher_model=self.args.distill_model)
+            teacher_b_path = self.args.distill_model if getattr(self.args, "l2_distill", True) else None
+            model = DistillationModel(student_model=student_model, teacher_model=teacher_b_path)
             if getattr(weights, "projector", None) is not None:
                 model.projector.load_state_dict(weights.projector.state_dict())  # restore the trained projector
             model.criterion = None
