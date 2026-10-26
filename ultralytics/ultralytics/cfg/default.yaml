@@ -101,7 +101,9 @@ warmup_momentum: 0.8 # (float) initial momentum during warmup
 warmup_bias_lr: 0.1 # (float) bias learning rate during warmup
 distill_model: # (str, optional) path to frozen Teacher B checkpoint (e.g. YOLO26-L best.pt)
 distill_data: # (str, optional) Dataset B YAML; independent images for Teacher-B feature distillation
-dino_distill: true # (bool) enable EMA Teacher A DINO-style self-distillation on Dataset A
+# Experiment toggles: DINO uses Dataset A with EMA Teacher A; L2 uses Dataset B with frozen Teacher B.
+dino_distill: true # (bool) enable DINO-style loss with EMA Teacher A on Dataset A
+l2_distill: true # (bool) enable feature L2 loss with frozen Teacher B on Dataset B
 distill_momentum: 0.996 # (float) EMA momentum for Teacher A only
 dino_weight: 1.0 # (float) DINO-style loss weight for Teacher A
 dis: 6.0 # (float) feature-distillation loss weight for Teacher B
