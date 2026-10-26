@@ -1,4 +1,4 @@
-# Ultralytics ðŸš€ AGPL-3.0 License - https://ultralytics.com/license
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 from __future__ import annotations
 
 from pathlib import Path
@@ -92,8 +92,11 @@ class DistillationModel(nn.Module):
         self.student_model.train()
         self.student_model.requires_grad_(True)
         self.self_distill = bool(student_model.args.get("dino_distill", True))
-        if not self.self_distill:
-            raise ValueError("Two-teacher mode requires dino_distill=True for EMA Teacher A.")
+        self.l2_distill = bool(student_model.args.get("l2_distill", teacher_model is not None))
+        if self.l2_distill and teacher_model is None:
+            raise ValueError("l2_distill=True requires distill_model=path/to/TeacherB_best.pt")
+        if not self.l2_distill:
+            teacher_model = None
 
         # Both teachers deliberately remain outside nn.Module._modules so the
         # optimizer and ModelEMA only track the student and trainable projectors.
@@ -777,7 +780,7 @@ class DistillationModel(nn.Module):
                 regular_loss, loss_distill, loss_dino, images_a.shape[0]
             ), loss_items
 
-        if self.teacher_b is not None and "teacher_img" not in batch:
+        if self.l2_distill and self.teacher_b is not None and "teacher_img" not in batch:
             raise KeyError(
                 "Teacher B is configured but batch['teacher_img'] is missing. Configure distill_data "
                 "and build the second dataloader in trainer.py."
@@ -792,31 +795,32 @@ class DistillationModel(nn.Module):
         regular_loss, loss_items = self.student_model.loss(batch, preds)
         teacher_a_feats = {idx: self._as_feature(v) for idx, v in self._teacher_feats.items()}
 
-        # DINO: only Teacher A is used here. Teacher B is never used for DINO.
-        global_views, local_views = self.create_dino_views(images_a)
-        teacher_dino_views = []
-        for view in global_views:
-            self._teacher_feats.clear()
-            with torch.no_grad():
-                self.teacher_a(view)
-            feat = self._as_feature(self._teacher_feats[self.dino_feature_idx])
-            teacher_dino_views.append(self.dino_teacher_projector(feat))
-        student_dino_views = []
-        for view in global_views + local_views:
-            self._student_feats.clear()
-            self.student_model(view)
-            feat = self._as_feature(self._student_feats[self.dino_feature_idx])
-            student_dino_views.append(self.dino_student_projector(feat))
-        num_terms = 0
-        for teacher_view in teacher_dino_views:
-            for student_view in student_dino_views:
-                loss_dino = loss_dino + self.dino_loss(student_view, teacher_view)
-                num_terms += 1
-        loss_dino = loss_dino / max(num_terms, 1)
+        # DINO flag: Teacher A only sees Dataset A. If disabled, skip all DINO crops/forwards.
+        if self.self_distill:
+            global_views, local_views = self.create_dino_views(images_a)
+            teacher_dino_views = []
+            for view in global_views:
+                self._teacher_feats.clear()
+                with torch.no_grad():
+                    self.teacher_a(view)
+                feat = self._as_feature(self._teacher_feats[self.dino_feature_idx])
+                teacher_dino_views.append(self.dino_teacher_projector(feat))
+            student_dino_views = []
+            for view in global_views + local_views:
+                self._student_feats.clear()
+                self.student_model(view)
+                feat = self._as_feature(self._student_feats[self.dino_feature_idx])
+                student_dino_views.append(self.dino_student_projector(feat))
+            num_terms = 0
+            for teacher_view in teacher_dino_views:
+                for student_view in student_dino_views:
+                    loss_dino = loss_dino + self.dino_loss(student_view, teacher_view)
+                    num_terms += 1
+            loss_dino = loss_dino / max(num_terms, 1)
 
         # Dataset B: the same B images pass through frozen Teacher B and Student.
         # Clear hooks so no Dataset A features can leak into this loss.
-        if self.teacher_b is not None:
+        if self.l2_distill and self.teacher_b is not None:
             images_b = batch["teacher_img"]
             self._teacher_b_feats.clear()
             self._student_feats.clear()
